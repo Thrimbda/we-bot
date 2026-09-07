@@ -1,0 +1,32 @@
+[package]
+name = "we-bot"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A small authenticated notification gateway for agent harnesses"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "3.2.0", features = ["transport-streamable-http-server"] }
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+subtle = "2.6"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
