@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use we_bot::{
-    config::Config, http::build_router, provider::WxPusherProvider, service::NotificationService,
+    config::Config, http::build_router, service::NotificationService, wechat::IlinkProvider,
 };
 
 #[tokio::main]
@@ -17,12 +17,17 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let provider = Arc::new(WxPusherProvider::new(config.wxpusher_spt.clone())?);
-    let service =
-        NotificationService::new(provider, config.dedupe_ttl, config.rate_limit_per_minute);
     let cancellation_token = CancellationToken::new();
+    let provider = IlinkProvider::new(config.state_path, cancellation_token.child_token())?;
+    provider.start().await;
+    let service = NotificationService::new(
+        Arc::new(provider.clone()),
+        config.dedupe_ttl,
+        config.rate_limit_per_minute,
+    );
     let app = build_router(
         service,
+        provider,
         config.api_token,
         config.allowed_hosts,
         cancellation_token.child_token(),

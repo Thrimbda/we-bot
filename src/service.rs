@@ -143,7 +143,7 @@ impl NotifyError {
         match self {
             Self::Validation(_) => "invalid_notification",
             Self::RateLimited { .. } => "rate_limited",
-            Self::Provider(_) => "provider_unavailable",
+            Self::Provider(error) => error.code(),
         }
     }
 
@@ -151,7 +151,7 @@ impl NotifyError {
         match self {
             Self::Validation(message) => message.clone(),
             Self::RateLimited { .. } => "notification rate limit exceeded".to_owned(),
-            Self::Provider(_) => "notification provider did not accept the message".to_owned(),
+            Self::Provider(error) => error.public_message().to_owned(),
         }
     }
 
