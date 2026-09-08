@@ -1,4 +1,10 @@
-use std::{env, fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    env, fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -19,7 +25,7 @@ impl Secret {
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub api_token: Secret,
-    pub wxpusher_spt: Secret,
+    pub state_path: PathBuf,
     pub allowed_hosts: Vec<String>,
     pub dedupe_ttl: Duration,
     pub rate_limit_per_minute: usize,
@@ -37,9 +43,11 @@ impl Config {
             bail!("WE_BOT_API_TOKEN must contain between 32 and 512 bytes");
         }
 
-        let wxpusher_spt = read_secret("WXPUSHER_SPT", "WXPUSHER_SPT_FILE")?;
-        if !wxpusher_spt.starts_with("SPT_") || wxpusher_spt.len() <= 4 {
-            bail!("WXPUSHER_SPT must be a non-empty SPT token");
+        let state_path = env::var_os("WE_BOT_STATE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("./data/state.json"));
+        if state_path.file_name().is_none() {
+            bail!("WE_BOT_STATE_PATH must point to a file");
         }
 
         let allowed_hosts = env::var("WE_BOT_ALLOWED_HOSTS")
@@ -65,7 +73,7 @@ impl Config {
         Ok(Self {
             bind_addr,
             api_token: Secret::new(api_token),
-            wxpusher_spt: Secret::new(wxpusher_spt),
+            state_path,
             allowed_hosts,
             dedupe_ttl,
             rate_limit_per_minute,

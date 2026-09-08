@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Path, Request, State, rejection::JsonRejection},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -24,6 +24,7 @@ use crate::{
         HealthResponse, NotificationInput, NotifyResponse,
     },
     service::{NotificationService, NotifyError},
+    wechat::{IlinkProvider, VerificationCodeInput, WeChatControlError},
 };
 
 const MAX_BATCH_SIZE: usize = 50;
@@ -32,6 +33,7 @@ const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 #[derive(Clone)]
 struct AppState {
     service: NotificationService,
+    wechat: IlinkProvider,
 }
 
 #[derive(Clone)]
@@ -41,12 +43,14 @@ struct AuthState {
 
 pub fn build_router(
     service: NotificationService,
+    wechat: IlinkProvider,
     api_token: Secret,
     allowed_hosts: Vec<String>,
     cancellation_token: CancellationToken,
 ) -> Router {
     let app_state = AppState {
         service: service.clone(),
+        wechat,
     };
 
     let mcp_service: StreamableHttpService<NotificationMcp, LocalSessionManager> =
@@ -65,6 +69,10 @@ pub fn build_router(
     let protected = Router::new()
         .route("/notify", post(notify))
         .route("/notify/batch", post(notify_batch))
+        .route("/wechat/status", get(wechat_status))
+        .route("/wechat/login", post(start_wechat_login))
+        .route("/wechat/login/{login_id}/poll", post(poll_wechat_login))
+        .route("/wechat/login/{login_id}/verify", post(verify_wechat_login))
         .nest_service("/mcp", mcp_service)
         .with_state(app_state)
         .layer(middleware::from_fn_with_state(
@@ -82,8 +90,45 @@ pub fn build_router(
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        provider: "wxpusher",
+        provider: "wechat_ilink",
     })
+}
+
+async fn wechat_status(State(state): State<AppState>) -> Response {
+    no_store(Json(state.wechat.status().await).into_response())
+}
+
+async fn start_wechat_login(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let response = state.wechat.start_login().await?;
+    Ok(no_store(Json(response).into_response()))
+}
+
+async fn poll_wechat_login(
+    State(state): State<AppState>,
+    Path(login_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let response = state.wechat.poll_login(&login_id, None).await?;
+    Ok(no_store(Json(response).into_response()))
+}
+
+async fn verify_wechat_login(
+    State(state): State<AppState>,
+    Path(login_id): Path<String>,
+    payload: Result<Json<VerificationCodeInput>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(input) = payload.map_err(ApiError::from_json_rejection)?;
+    let response = state
+        .wechat
+        .poll_login(&login_id, Some(input.code.trim()))
+        .await?;
+    Ok(no_store(Json(response).into_response()))
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn notify(
@@ -210,6 +255,10 @@ impl From<NotifyError> for ApiError {
         let status = match &error {
             NotifyError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             NotifyError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            NotifyError::Provider(error) if error.is_setup_error() => StatusCode::CONFLICT,
+            NotifyError::Provider(crate::provider::ProviderError::PayloadTooLarge) => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
             NotifyError::Provider(_) => StatusCode::BAD_GATEWAY,
         };
         if matches!(error, NotifyError::Provider(_)) {
@@ -220,6 +269,29 @@ impl From<NotifyError> for ApiError {
             code: error.code(),
             message: error.public_message(),
             retry_after: error.retry_after(),
+        }
+    }
+}
+
+impl From<WeChatControlError> for ApiError {
+    fn from(error: WeChatControlError) -> Self {
+        let status = if error.is_not_found() {
+            StatusCode::NOT_FOUND
+        } else if error.is_gone() {
+            StatusCode::GONE
+        } else if error.is_validation() {
+            StatusCode::UNPROCESSABLE_ENTITY
+        } else if matches!(error, WeChatControlError::Persistence(_)) {
+            StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        error!(code = error.code(), reason = %error, "WeChat control request failed");
+        Self {
+            status,
+            code: error.code(),
+            message: error.public_message().to_owned(),
+            retry_after: None,
         }
     }
 }
@@ -251,19 +323,26 @@ mod tests {
 
     use async_trait::async_trait;
     use axum::{
+        Json, Router,
         body::Body,
         http::{Request, StatusCode, header},
+        response::IntoResponse,
+        routing::post,
     };
     use http_body_util::BodyExt;
+    use reqwest::Url;
     use serde_json::{Value, json};
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
-    use super::build_router;
+    use super::{ApiError, build_router};
     use crate::{
         config::Secret,
         model::Notification,
         provider::{NotificationProvider, ProviderError},
-        service::NotificationService,
+        service::{NotificationService, NotifyError},
+        wechat::IlinkProvider,
     };
 
     struct MockProvider;
@@ -280,12 +359,32 @@ mod tests {
     }
 
     fn app() -> axum::Router {
+        let directory = TempDir::new().unwrap();
+        let cancellation = CancellationToken::new();
+        let wechat = IlinkProvider::new_for_test(
+            Url::parse("http://127.0.0.1:9/").unwrap(),
+            directory.path().join("state.json"),
+            cancellation.child_token(),
+        )
+        .unwrap();
+        app_with_wechat(wechat, cancellation)
+    }
+
+    fn app_with_wechat(wechat: IlinkProvider, cancellation: CancellationToken) -> axum::Router {
         build_router(
             NotificationService::new(Arc::new(MockProvider), Duration::from_secs(60), 100),
+            wechat,
             Secret::new("a".repeat(32)),
             vec!["localhost".to_owned()],
-            tokio_util::sync::CancellationToken::new(),
+            cancellation,
         )
+    }
+
+    async fn qr_login_response() -> Json<Value> {
+        Json(json!({
+            "qrcode": "opaque-login-id",
+            "qrcode_img_content": "https://example.test/qr-content"
+        }))
     }
 
     async fn json_body(response: axum::response::Response) -> Value {
@@ -300,7 +399,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(json_body(response).await["status"], "ok");
+        let body = json_body(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["provider"], "wechat_ilink");
+    }
+
+    #[tokio::test]
+    async fn wechat_status_is_protected_and_redacted() {
+        let unauthorized = app()
+            .oneshot(Request::get("/wechat/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app()
+            .oneshot(
+                Request::get("/wechat/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(32)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+        assert_eq!(authorized.headers()[header::CACHE_CONTROL], "no-store");
+        let body = json_body(authorized).await;
+        assert_eq!(body["state"], "not_linked");
+        assert!(body.get("bot_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn wechat_login_route_is_authenticated_and_not_cached() {
+        let upstream = Router::new().route("/ilink/bot/get_bot_qrcode", post(qr_login_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url =
+            Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let upstream_handle = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let directory = TempDir::new().unwrap();
+        let cancellation = CancellationToken::new();
+        let wechat = IlinkProvider::new_for_test(
+            upstream_url,
+            directory.path().join("state.json"),
+            cancellation.child_token(),
+        )
+        .unwrap();
+
+        let response = app_with_wechat(wechat, cancellation)
+            .oneshot(
+                Request::post("/wechat/login")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(32)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = json_body(response).await;
+        assert_eq!(body["qr_content"], "https://example.test/qr-content");
+        assert_eq!(body["status"], "waiting_for_scan");
+        assert!(body.get("bot_token").is_none());
+
+        upstream_handle.abort();
     }
 
     #[tokio::test]
@@ -316,6 +478,15 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(json_body(response).await["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn unlinked_wechat_maps_to_conflict_without_secret_details() {
+        let response =
+            ApiError::from(NotifyError::Provider(ProviderError::NotLinked)).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "wechat_not_linked");
     }
 
     #[tokio::test]

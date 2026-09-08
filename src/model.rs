@@ -11,7 +11,7 @@ pub struct NotificationInput {
     pub event: Option<String>,
     /// Human-readable notification title.
     pub title: String,
-    /// Notification body. Markdown is supported.
+    /// Plain-text notification body.
     pub body: String,
     /// Optional HTTP(S) link associated with the notification.
     pub url: Option<String>,

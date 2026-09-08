@@ -1,6 +1,6 @@
 [package]
 name = "we-bot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A small authenticated notification gateway for agent harnesses"
@@ -9,6 +9,8 @@ description = "A small authenticated notification gateway for agent harnesses"
 anyhow = "1.0"
 async-trait = "0.1"
 axum = "0.8.9"
+base64 = "0.22"
+getrandom = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "3.2.0", features = ["transport-streamable-http-server"] }
 schemars = "1.0"
@@ -25,6 +27,7 @@ url = "2.5"
 
 [dev-dependencies]
 http-body-util = "0.1"
+tempfile = "3.20"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
