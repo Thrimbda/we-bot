@@ -27,6 +27,6 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium webkit
       - run: npm test
-      - run: npm test -- -g 'Auth Mini'
+      - run: npm test
         env:
           PLAYWRIGHT_BROWSER: webkit

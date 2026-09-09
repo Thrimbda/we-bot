@@ -394,6 +394,8 @@ struct SendResponse {
     ret: Option<i64>,
     #[serde(default)]
     errcode: Option<i64>,
+    #[serde(default)]
+    errmsg: Option<String>,
 }
 
 impl IlinkProvider {
@@ -884,6 +886,7 @@ impl IlinkProvider {
                 .iter()
                 .rev()
                 .filter(|message| message.from_user_id.as_deref() == Some(user_id.as_str()))
+                .filter(|message| message.message_type != Some(2))
                 .filter_map(|message| message.context_token.as_ref())
                 .find(|token| !token.is_empty())
                 .cloned();
@@ -1063,11 +1066,29 @@ impl IlinkProvider {
             .await?;
         let response = decode_json::<SendResponse>(response).await?;
         if let Some(code) = nonzero_code(response.ret, response.errcode) {
+            // Do not log arbitrary upstream text, which may contain credentials or message content.
+            let prepare_failed = code == -2 && response.errmsg.as_deref() == Some("prepare failed");
+            warn!(
+                ret = response.ret,
+                errcode = response.errcode,
+                prepare_failed,
+                text_chars = text.chars().count(),
+                "iLink explicitly rejected message"
+            );
             if code == STALE_TOKEN_CODE {
                 self.inner.auth_stale.store(true, Ordering::Release);
                 return Err(ProviderError::SessionStale);
             }
+            if prepare_failed {
+                self.invalidate_send_context(&account_id, &bot_token, &context_token)
+                    .await;
+                return Err(ProviderError::SendBlocked);
+            }
             return Err(ProviderError::Rejected { code });
+        }
+        // HTTP 200 without an explicit acknowledgement cannot prove acceptance.
+        if response.ret != Some(0) {
+            return Err(ProviderError::InvalidResponse);
         }
         let message = ChatMessage {
             id: client_id,
@@ -1095,6 +1116,26 @@ impl IlinkProvider {
             history_saved,
         })
     }
+
+    async fn invalidate_send_context(
+        &self,
+        account_id: &str,
+        bot_token: &str,
+        context_token: &str,
+    ) {
+        let mut state = self.inner.state.write().await;
+        // A late failure must not erase a context received during the send or a new binding.
+        if state.account_id.as_deref() != Some(account_id)
+            || state.bot_token.as_deref() != Some(bot_token)
+            || state.context_token.as_deref() != Some(context_token)
+        {
+            return;
+        }
+        state.context_token = None;
+        if persist_state(&self.inner.state_path, &state).is_err() {
+            warn!("failed to persist rejected iLink context; sending remains blocked in memory");
+        }
+    }
 }
 
 fn base_info() -> serde_json::Value {
@@ -1121,8 +1162,8 @@ fn required_response_field(value: Option<String>) -> Result<String, ProviderErro
 
 async fn decode_json<T: for<'de> Deserialize<'de>>(response: Response) -> Result<T, ProviderError> {
     if !response.status().is_success() {
-        return Err(ProviderError::Rejected {
-            code: i64::from(response.status().as_u16()),
+        return Err(ProviderError::HttpStatus {
+            code: response.status().as_u16(),
         });
     }
     response
@@ -1132,8 +1173,10 @@ async fn decode_json<T: for<'de> Deserialize<'de>>(response: Response) -> Result
 }
 
 fn nonzero_code(ret: Option<i64>, errcode: Option<i64>) -> Option<i64> {
-    ret.filter(|code| *code != 0)
-        .or_else(|| errcode.filter(|code| *code != 0))
+    // `ret` can be a generic failure while `errcode` explains it (for example, stale auth).
+    errcode
+        .filter(|code| *code != 0)
+        .or_else(|| ret.filter(|code| *code != 0))
 }
 
 fn format_notification(notification: &Notification) -> String {
@@ -1333,7 +1376,7 @@ mod tests {
         fs,
         sync::{
             Arc,
-            atomic::{AtomicBool, AtomicI64, Ordering},
+            atomic::{AtomicBool, AtomicI64, AtomicU16, Ordering},
         },
         time::Duration,
     };
@@ -1341,7 +1384,7 @@ mod tests {
     use axum::{
         Json, Router,
         extract::State,
-        http::{HeaderMap, Uri},
+        http::{HeaderMap, StatusCode, Uri},
         routing::{get, post},
     };
     use reqwest::Url;
@@ -1366,6 +1409,11 @@ mod tests {
         send_notify: Arc<Notify>,
         owner_id: Arc<Mutex<String>>,
         send_code: Arc<AtomicI64>,
+        send_response: Arc<Mutex<Option<Value>>>,
+        send_http_status: Arc<AtomicU16>,
+        send_release: Arc<Mutex<Option<Arc<Notify>>>>,
+        next_updates: Arc<Mutex<Option<Value>>>,
+        update_notify: Arc<Notify>,
     }
 
     async fn qr(
@@ -1415,25 +1463,48 @@ mod tests {
                     "item_list": [{"type": 1, "text_item": {"text": "不属于本账户的消息"}}]
                 }, {
                     "from_user_id": "owner-user-id",
+                    "context_token": "bot-echo-context-token",
                     "message_id": 703,
                     "message_type": 2,
                     "item_list": [{"type": 1, "text_item": {"text": "机器人回声"}}]
                 }]
             }));
         }
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        Json(json!({ "ret": 0, "msgs": [] }))
+        let response = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Some(response) = state.next_updates.lock().await.take() {
+                    return response;
+                }
+                state.update_notify.notified().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| json!({ "ret": 0, "msgs": [] }));
+        Json(response)
     }
 
     async fn send_message(
         State(state): State<MockApi>,
         headers: HeaderMap,
         Json(payload): Json<Value>,
-    ) -> Json<Value> {
+    ) -> (StatusCode, Json<Value>) {
         *state.send_payload.lock().await = Some(payload);
         *state.send_headers.lock().await = Some(headers);
         state.send_notify.notify_one();
-        Json(json!({ "ret": state.send_code.load(Ordering::Acquire) }))
+        if let Some(release) = state.send_release.lock().await.take() {
+            release.notified().await;
+        }
+        (
+            StatusCode::from_u16(state.send_http_status.load(Ordering::Acquire)).unwrap(),
+            Json(
+                state
+                    .send_response
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| json!({ "ret": state.send_code.load(Ordering::Acquire) })),
+            ),
+        )
     }
 
     async fn lifecycle() -> Json<Value> {
@@ -1449,6 +1520,11 @@ mod tests {
             send_notify: Arc::new(Notify::new()),
             owner_id: Arc::new(Mutex::new("owner-user-id".to_owned())),
             send_code: Arc::new(AtomicI64::new(0)),
+            send_response: Arc::new(Mutex::new(None)),
+            send_http_status: Arc::new(AtomicU16::new(200)),
+            send_release: Arc::new(Mutex::new(None)),
+            next_updates: Arc::new(Mutex::new(None)),
+            update_notify: Arc::new(Notify::new()),
         };
         let app = Router::new()
             .route("/ilink/bot/get_bot_qrcode", post(qr))
@@ -1687,6 +1763,213 @@ mod tests {
             "disk failure must not encourage resending an accepted message"
         );
         assert_eq!(provider.messages(&id).await.unwrap().messages.len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn prepare_rejection_blocks_chat_and_notifications_until_a_new_owner_message() {
+        let (api, base_url, server) = spawn_api().await;
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("state.json");
+        let mut fixture = legacy_state();
+        fixture["base_url"] = json!(base_url.as_str());
+        fixture["user_id"] = json!("owner-user-id");
+        fs::write(&path, fixture.to_string()).unwrap();
+        let shutdown = CancellationToken::new();
+        let provider =
+            IlinkProvider::new_for_test(base_url.clone(), path.clone(), shutdown.clone()).unwrap();
+        let id = provider.accounts().await.accounts[0].id.clone();
+        *api.send_response.lock().await = Some(json!({"ret": -2, "errmsg": "prepare failed"}));
+        assert!(matches!(
+            provider.send_message(&id, "你好".into()).await,
+            Err(ProviderError::SendBlocked)
+        ));
+        assert!(provider.messages(&id).await.unwrap().messages.is_empty());
+        assert!(matches!(
+            provider.status().await.state,
+            WeChatConnectionState::WaitingForMessage
+        ));
+        let reloaded =
+            IlinkProvider::new_for_test(base_url, path, CancellationToken::new()).unwrap();
+        assert!(matches!(
+            reloaded.status().await.state,
+            WeChatConnectionState::WaitingForMessage
+        ));
+        *api.send_payload.lock().await = None;
+        assert!(matches!(
+            provider.send(&notification()).await,
+            Err(ProviderError::ContextNotReady)
+        ));
+        assert!(matches!(
+            provider.send_message(&id, "再试".into()).await,
+            Err(ProviderError::ContextNotReady)
+        ));
+        assert!(
+            api.send_payload.lock().await.is_none(),
+            "blocked sends must not reach WeChat"
+        );
+
+        api.update_sent.store(true, Ordering::Release);
+        *api.next_updates.lock().await = Some(
+            json!({"ret": 0, "get_updates_buf": "untrusted-cursor", "msgs": [
+                {"from_user_id": "stranger", "context_token": "stranger-context", "message_type": 1},
+                {"from_user_id": "owner-user-id", "context_token": "echo-context", "message_type": 2}
+            ]}),
+        );
+        provider.start().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while provider.inner.state.read().await.get_updates_buf != "untrusted-cursor" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            provider.status().await.state,
+            WeChatConnectionState::WaitingForMessage
+        ));
+        *api.next_updates.lock().await = Some(
+            json!({"ret": 0, "get_updates_buf": "fresh-cursor", "msgs": [
+                {"from_user_id": "owner-user-id", "context_token": "fresh-owner-context", "message_type": 1,
+                 "message_id": 704, "item_list": [{"type": 1, "text_item": {"text": "恢复发送"}}]}
+            ]}),
+        );
+        api.update_notify.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(provider.status().await.state, WeChatConnectionState::Ready) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            api.send_payload.lock().await.is_none(),
+            "receiving a new context must not automatically resend"
+        );
+        *api.send_response.lock().await = None;
+        let result = provider
+            .send_message(&id, "恢复后的手动发送".into())
+            .await
+            .unwrap();
+        assert!(result.history_saved);
+        assert_eq!(
+            api.send_payload.lock().await.as_ref().unwrap()["msg"]["context_token"],
+            "fresh-owner-context"
+        );
+        assert_eq!(provider.messages(&id).await.unwrap().messages.len(), 2);
+        shutdown.cancel();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn late_rejection_does_not_erase_a_fresh_context_received_during_send() {
+        let (api, base_url, server) = spawn_api().await;
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("state.json");
+        let mut fixture = legacy_state();
+        fixture["base_url"] = json!(base_url.as_str());
+        fixture["user_id"] = json!("owner-user-id");
+        fs::write(&path, fixture.to_string()).unwrap();
+        let shutdown = CancellationToken::new();
+        let provider = IlinkProvider::new_for_test(base_url, path, shutdown.clone()).unwrap();
+        let id = provider.accounts().await.accounts[0].id.clone();
+        *api.send_response.lock().await = Some(json!({"ret": -2, "errmsg": "prepare failed"}));
+        let release = Arc::new(Notify::new());
+        *api.send_release.lock().await = Some(release.clone());
+        let sender = provider.clone();
+        let request =
+            tokio::spawn(async move { sender.send_message(&id, "旧上下文请求".into()).await });
+        tokio::time::timeout(Duration::from_secs(2), api.send_notify.notified())
+            .await
+            .unwrap();
+        provider.start().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while provider.inner.state.read().await.context_token.as_deref()
+                != Some("owner-context-token")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        release.notify_one();
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(ProviderError::SendBlocked)
+        ));
+        assert!(matches!(
+            provider.status().await.state,
+            WeChatConnectionState::Ready
+        ));
+        *api.send_response.lock().await = None;
+        provider.send(&notification()).await.unwrap();
+        assert_eq!(
+            api.send_payload.lock().await.as_ref().unwrap()["msg"]["context_token"],
+            "owner-context-token"
+        );
+        shutdown.cancel();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_and_other_rejections_do_not_invalidate_context_or_record_success() {
+        let (api, base_url, server) = spawn_api().await;
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("state.json");
+        let mut fixture = legacy_state();
+        fixture["base_url"] = json!(base_url.as_str());
+        fs::write(&path, fixture.to_string()).unwrap();
+        let provider =
+            IlinkProvider::new_for_test(base_url, path, CancellationToken::new()).unwrap();
+        let id = provider.accounts().await.accounts[0].id.clone();
+        for (response, expected_code) in [
+            (json!({}), "provider_unavailable"),
+            (json!({"errcode": 0}), "provider_unavailable"),
+            (
+                json!({"ret": -2, "errmsg": "rate limited"}),
+                "wechat_request_rejected",
+            ),
+            (
+                json!({"ret": 0, "errcode": 1001}),
+                "wechat_request_rejected",
+            ),
+        ] {
+            *api.send_response.lock().await = Some(response);
+            let error = provider
+                .send_message(&id, "未接受".into())
+                .await
+                .err()
+                .expect("upstream did not accept the message");
+            assert_eq!(error.code(), expected_code);
+            assert!(matches!(
+                provider.status().await.state,
+                WeChatConnectionState::Ready
+            ));
+            assert!(provider.messages(&id).await.unwrap().messages.is_empty());
+        }
+        api.send_http_status.store(502, Ordering::Release);
+        *api.send_response.lock().await = Some(json!({"ret": 0}));
+        let error = provider
+            .send(&notification())
+            .await
+            .expect_err("HTTP failure has no acknowledgement");
+        assert_eq!(error.code(), "provider_unavailable");
+        assert!(provider.messages(&id).await.unwrap().messages.is_empty());
+        assert!(matches!(
+            provider.status().await.state,
+            WeChatConnectionState::Ready
+        ));
+        api.send_http_status.store(200, Ordering::Release);
+        *api.send_response.lock().await =
+            Some(json!({"ret": -2, "errcode": -14, "errmsg": "prepare failed"}));
+        assert!(matches!(
+            provider.send(&notification()).await,
+            Err(ProviderError::SessionStale)
+        ));
+        assert!(matches!(
+            provider.status().await.state,
+            WeChatConnectionState::RelinkRequired
+        ));
         server.abort();
     }
 

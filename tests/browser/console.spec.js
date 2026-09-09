@@ -162,6 +162,46 @@ test('failed sends preserve drafts and do not retry automatically', async ({ pag
   await expect(page.locator('.message-bubble').filter({ hasText: '应保留的草稿' })).toHaveCount(1);
 });
 
+test('WeChat preparation rejection waits for an owner message and preserves the draft through recovery', async ({ page }) => {
+  const model = await fixture(page, { sendError: 'wechat_send_blocked', holdSend: true });
+  await connect(page);
+  await open(page);
+  await page.locator('#message-input').fill('你好');
+  await page.locator('#send-button').click();
+  await expect.poll(() => !!model.releaseSend).toBe(true);
+  model.accounts[0].state = 'waiting_for_message';
+  model.releaseSend();
+  await expect(page.locator('#send-error')).toContainText('微信已拒绝本条消息，未发送');
+  await expect(page.locator('#chat-subtitle')).toContainText('等待微信消息');
+  await expect(page.locator('#chat-state-notice')).toContainText('给 ClawBot 发一条新消息');
+  await expect(page.locator('#send-button')).toBeDisabled();
+  await expect(page.locator('#message-input')).toHaveValue('你好');
+  await expect(page.getByText('正在发送…', { exact: true })).toHaveCount(0);
+  await expect(page.locator('.message-bubble').filter({ hasText: /^你好$/ })).toHaveCount(0);
+  model.accounts[0].state = 'ready';
+  model.histories.get(A).push(message('in:recovery', '恢复发送'));
+  model.sendError = null;
+  model.holdSend = false;
+  await page.locator('#refresh').click();
+  await expect(page.locator('#send-button')).toBeEnabled();
+  await expect(page.locator('#message-input')).toHaveValue('你好');
+  expect(model.sent).toHaveLength(1);
+  await page.locator('#send-button').click();
+  await expect(page.locator('#message-input')).toHaveValue('');
+  expect(model.sent).toHaveLength(2);
+});
+
+test('explicit WeChat rejection is distinct from an unconfirmed send', async ({ page }) => {
+  const model = await fixture(page, { sendError: 'wechat_request_rejected' });
+  await connect(page);
+  await open(page);
+  await page.locator('#message-input').fill('微信拒绝时保留的草稿');
+  await page.locator('#send-button').click();
+  await expect(page.locator('#send-error')).toContainText('微信已拒绝本条消息，未发送');
+  await expect(page.locator('#message-input')).toHaveValue('微信拒绝时保留的草稿');
+  expect(model.sent).toHaveLength(1);
+});
+
 test('multiple account drafts and late responses never mix conversations', async ({ page }) => {
   const model = await fixture(page);
   model.accounts.push({ id: B, display_name: '微信账户 · 4b9e10', state: 'ready', monitor_running: true });
@@ -213,7 +253,7 @@ test('activation, expired binding, read failure, and expired API credentials are
   model.accounts[0].state = 'waiting_for_message';
   await connect(page);
   await open(page);
-  await expect(page.locator('#chat-state-notice')).toContainText('请先在微信中');
+  await expect(page.locator('#chat-state-notice')).toContainText('请在微信中给 ClawBot 发一条新消息');
   await expect(page.locator('#message-input')).toBeDisabled();
   model.accounts[0].state = 'relink_required';
   await page.locator('#refresh').click();

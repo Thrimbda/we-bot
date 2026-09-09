@@ -11,7 +11,7 @@ const shortTime = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2
 const fullDate = new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric' });
 const statuses = {
   ready: { label: '可发送', className: 'ready', notice: '' },
-  waiting_for_message: { label: '等待激活', className: 'warning', notice: '请先在微信中给 ClawBot 发一条消息，收到后即可从这里发送。' },
+  waiting_for_message: { label: '等待微信消息', className: 'warning', notice: '请在微信中给 ClawBot 发一条新消息，更新发送权限后即可继续。草稿会保留，请在恢复后手动发送。' },
   relink_required: { label: '需要重新绑定', className: 'warning', notice: '微信绑定已失效，请通过服务端重新扫码绑定。已有会话仍可查看。' },
   not_linked: { label: '未绑定', className: '', notice: '此账户尚未完成微信绑定。' },
 };
@@ -86,7 +86,9 @@ function errorText(error, sending = false) {
     invalid_origin: '发送来源无法验证，请从本站重新打开会话。',
     account_not_found: '这个账户已不再绑定到当前服务器，请刷新账户列表。',
     wechat_not_linked: '请先完成微信绑定，再发送消息。',
-    wechat_context_not_ready: '请先在微信里给 ClawBot 发一条消息，再重试。',
+    wechat_context_not_ready: '请在微信里给 ClawBot 发一条新消息，更新发送权限后再重试。草稿已保留。',
+    wechat_send_blocked: '微信已拒绝本条消息，未发送。请在微信里给 ClawBot 发一条新消息，再回来重试。草稿已保留。',
+    wechat_request_rejected: '微信已拒绝本条消息，未发送。草稿已保留，请稍后手动重试。',
     wechat_relink_required: '微信绑定已失效，请重新扫码绑定。',
     rate_limited: '发送过于频繁，请稍后再试。',
     invalid_notification: '消息需包含 1–4,000 个字符。',
@@ -532,6 +534,8 @@ $('send-form').addEventListener('submit', async (event) => {
     if (epoch === state.epoch) {
       updateComposer();
       if (state.selected === id && !matchMedia('(max-width: 720px)').matches) $('message-input').focus({ preventScroll: true });
+      // Re-read the account after a send: upstream rejection can invalidate its sending context.
+      refresh();
       scheduleRefresh();
     }
   }
