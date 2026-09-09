@@ -1,4 +1,6 @@
+pub mod chat;
 pub mod config;
+pub mod console_auth;
 pub mod http;
 pub mod mcp;
 pub mod model;

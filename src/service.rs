@@ -99,7 +99,7 @@ impl NotificationService {
         }
     }
 
-    async fn acquire_rate_slot(&self) -> Result<(), NotifyError> {
+    pub(crate) async fn acquire_rate_slot(&self) -> Result<(), NotifyError> {
         let now = Instant::now();
         let window = Duration::from_secs(60);
         let mut entries = self.rate.lock().await;

@@ -1,2 +1,8 @@
 /target/
 .env
+node_modules/
+test-results/
+playwright-report/
+.playwright-cli/
+.impeccable/review/
+.impeccable/hook.cache.json

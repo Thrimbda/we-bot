@@ -1,0 +1,131 @@
+<!doctype html>
+<!--
+  Operate surface: we-bot account list and per-account conversation.
+  Reference: getdesign.md/supabase/design-md (white canvas, hairlines, emerald actions).
+  First viewport: a compact server header, account list, and a readable conversation pane.
+  Signature interaction: select an account, send a test, then read its WeChat reply in place.
+  Motion: brief state transitions only; incoming messages preserve the reader's scroll anchor.
+  Finish: desktop/mobile inspection, independent finish review, and DESIGN.md from the built UI.
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="查看绑定的微信账户，发送测试消息并接收微信回信。">
+    <title>微信账户 · we-bot</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%233ecf8e'/%3E%3Cpath d='M8 9h16v11H14l-6 4z' fill='none' stroke='%23171717' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/assets/console.css">
+    <script type="module" src="/assets/console.js"></script>
+  </head>
+  <body>
+    <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z"/><path d="M8 10h8M8 14h5"/></symbol>
+      <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01M16 6.5h2M16 17.5h2"/></symbol>
+      <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M7 17 17 7M7 7h10v10"/></symbol>
+      <symbol id="i-back" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6"/></symbol>
+      <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 11.6-1.6L20 8M4 16l2.4 2.6A7 7 0 0 0 18 17"/></symbol>
+      <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 15v2"/></symbol>
+      <symbol id="i-exit" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 7h.01"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+      <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    </svg>
+
+    <a class="skip-link" href="#main">跳转到主要内容</a>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="we-bot 首页">
+          <span class="brand-mark"><svg class="icon"><use href="#i-chat"/></svg></span>
+          <span>we-bot</span>
+        </a>
+        <span class="nav-divider" aria-hidden="true"></span>
+        <span class="nav-label">微信账户</span>
+        <div class="server-chip" title="当前通知服务器">
+          <svg class="icon"><use href="#i-server"/></svg>
+          <span id="server-host"></span>
+          <span class="server-indicator" id="server-indicator" aria-hidden="true"></span>
+        </div>
+        <button class="icon-button" id="disconnect" type="button" aria-label="断开连接" title="断开连接" hidden><svg class="icon"><use href="#i-exit"/></svg></button>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="connect-view" id="connect-view" aria-labelledby="connect-title">
+        <div class="connect-symbol"><svg class="icon"><use href="#i-lock"/></svg></div>
+        <h1 id="connect-title">正在检查登录状态</h1>
+        <p class="connect-description" id="connect-description">请稍候，即将打开你的微信账户。</p>
+        <form id="connect-form" class="connect-form" hidden>
+          <label for="api-token">API Token</label>
+          <input id="api-token" name="api-token" type="password" autocomplete="off" spellcheck="false" required placeholder="输入此服务器的 API Token" aria-describedby="token-hint connect-error">
+          <p id="token-hint" class="field-hint">凭据仅保留在当前页面，刷新后需重新输入。</p>
+          <button class="button primary connect-button" id="connect-button" type="submit"><span>连接服务器</span><svg class="icon"><use href="#i-arrow"/></svg></button>
+        </form>
+        <p class="error-text" id="connect-error" role="alert" hidden></p>
+        <button class="button primary connect-button" id="auth-login" type="button" hidden>使用 Auth Mini 登录<svg class="icon"><use href="#i-arrow"/></svg></button>
+        <button class="button secondary connect-button" id="auth-retry" type="button" hidden>重新检查登录</button>
+        <p class="connect-footnote" id="connect-footnote" hidden>使用服务启动时配置的访问凭据。</p>
+      </section>
+
+      <section id="workspace" class="workspace" aria-label="微信账户工作区" hidden>
+        <div class="page-heading">
+          <div><h1>微信账户</h1><p>一个账户，一段对话。消息从这里抵达微信。</p></div>
+          <button class="button secondary" id="refresh" type="button"><svg class="icon"><use href="#i-refresh"/></svg><span>刷新</span></button>
+        </div>
+        <div id="connection-notice" class="notice" role="status" hidden></div>
+        <div class="conversation-shell" id="conversation-shell">
+          <aside class="account-pane" aria-label="已绑定账户">
+            <div class="account-pane-heading"><h2>已绑定账户</h2><span class="count" id="account-count">0</span></div>
+            <div class="account-list" id="account-list"></div>
+            <div class="account-pane-footer"><svg class="icon"><use href="#i-server"/></svg><span>绑定到当前服务器</span></div>
+          </aside>
+
+          <section class="welcome-pane" id="welcome-pane" aria-labelledby="welcome-title">
+            <div class="welcome-content">
+              <svg class="welcome-icon icon"><use href="#i-chat"/></svg>
+              <h2 id="welcome-title">让消息有来有回</h2>
+              <p id="welcome-description">选择左侧的微信账户，发送一条测试消息，<br class="desktop-break">也能在这里看到微信里的回复。</p>
+              <div class="message-path" aria-hidden="true"><span>Notify Server</span><span class="path-line"></span><span>微信</span></div>
+            </div>
+            <p class="welcome-footnote">会话按账户独立显示</p>
+          </section>
+
+          <section class="chat-pane" id="chat-pane" aria-labelledby="chat-title" hidden>
+            <header class="chat-header">
+              <button class="icon-button back-button" id="back" type="button" aria-label="返回账户列表"><svg class="icon"><use href="#i-back"/></svg></button>
+              <div class="avatar chat-avatar" aria-hidden="true">微</div>
+              <div class="chat-heading"><h2 id="chat-title"></h2><p id="chat-subtitle"></p></div>
+              <button class="icon-button" id="account-info-button" type="button" aria-label="查看账户映射" aria-controls="account-info" aria-expanded="false" title="账户映射"><svg class="icon"><use href="#i-info"/></svg></button>
+            </header>
+            <dl id="account-info" class="account-info" hidden><div><dt>当前服务器</dt><dd id="mapping-server"></dd></div><div><dt>账户 ID</dt><dd id="mapping-account"></dd></div></dl>
+            <div class="chat-state-notice" id="chat-state-notice" hidden></div>
+            <div class="history-region">
+              <div class="message-feed" id="message-feed" role="region" aria-label="聊天记录" aria-live="off" tabindex="0">
+                <div class="chat-empty" id="chat-empty"><h3>从第一条消息开始</h3><p>发送一条测试消息，然后在微信里回复。<br>往返消息会显示在这里。</p></div>
+                <ol class="messages" id="messages"></ol>
+              </div>
+              <div class="sr-only" id="conversation-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+              <button class="button new-message-button" id="new-messages" type="button" hidden>查看新消息<svg class="icon"><use href="#i-down"/></svg></button>
+            </div>
+            <footer class="chat-footer">
+              <p class="error-text send-error" id="send-error" role="alert" hidden></p>
+              <form id="send-form" class="composer">
+                <label class="sr-only" for="message-input">发送给此微信账户的消息</label>
+                <textarea id="message-input" rows="3" placeholder="写一条消息，发送到微信…" aria-describedby="composer-hint message-count"></textarea>
+                <div class="composer-toolbar">
+                  <button class="text-button" id="test-message" type="button">填入测试消息</button>
+                  <span class="message-count" id="message-count">0 / 4,000</span>
+                  <button class="button primary send-button" id="send-button" type="submit" disabled><span>发送</span><svg class="icon"><use href="#i-send"/></svg></button>
+                </div>
+              </form>
+              <div class="composer-hints"><span id="composer-hint">Enter 发送<span class="hint-dot">·</span>Shift + Enter 换行</span><span>仅保留最近 200 条消息</span></div>
+            </footer>
+          </section>
+        </div>
+        <div class="workspace-footer"><span>微信 ClawBot</span><span id="sync-label" role="status">消息会自动更新</span></div>
+      </section>
+      <noscript><p class="no-script">请启用 JavaScript 以查看账户和消息。</p></noscript>
+    </main>
+  </body>
+</html>
