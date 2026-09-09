@@ -1064,7 +1064,11 @@ impl IlinkProvider {
         let response = self
             .post_json(url, Some(&bot_token), &request, SEND_TIMEOUT)
             .await?;
-        let response = decode_json::<SendResponse>(response).await?;
+        // iLink permits omitted zero-valued ACK fields, including {}. Require a JSON
+        // object so an empty body, null, array, or malformed response cannot become success.
+        let response = decode_json::<serde_json::Map<String, serde_json::Value>>(response).await?;
+        let response: SendResponse =
+            serde_json::from_value(response.into()).map_err(|_| ProviderError::InvalidResponse)?;
         if let Some(code) = nonzero_code(response.ret, response.errcode) {
             // Do not log arbitrary upstream text, which may contain credentials or message content.
             let prepare_failed = code == -2 && response.errmsg.as_deref() == Some("prepare failed");
@@ -1086,10 +1090,12 @@ impl IlinkProvider {
             }
             return Err(ProviderError::Rejected { code });
         }
-        // HTTP 200 without an explicit acknowledgement cannot prove acceptance.
-        if response.ret != Some(0) {
-            return Err(ProviderError::InvalidResponse);
-        }
+        // Match Tencent's client: absent return codes have the same meaning as zero.
+        info!(
+            ack_ret_present = response.ret.is_some(),
+            ack_errcode_present = response.errcode.is_some(),
+            "iLink accepted message"
+        );
         let message = ChatMessage {
             id: client_id,
             account_id: account_id.clone(),
@@ -1912,6 +1918,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn omitted_zero_ack_fields_record_accepted_chat_and_notifications() {
+        let (api, base_url, server) = spawn_api().await;
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("state.json");
+        let mut fixture = legacy_state();
+        fixture["base_url"] = json!(base_url.as_str());
+        fs::write(&path, fixture.to_string()).unwrap();
+        let provider =
+            IlinkProvider::new_for_test(base_url.clone(), path.clone(), CancellationToken::new())
+                .unwrap();
+        let id = provider.accounts().await.accounts[0].id.clone();
+        let acknowledgements = [
+            json!({}),
+            json!({"errcode": 0}),
+            json!({"ret": 0}),
+            json!({"ret": 0, "errcode": 0, "errmsg": ""}),
+        ];
+        for (index, response) in acknowledgements.into_iter().enumerate() {
+            *api.send_response.lock().await = Some(response.clone());
+            let text = format!("ACK regression {index}");
+            let result = provider.send_message(&id, text.clone()).await;
+            assert!(result.is_ok(), "valid iLink ACK was rejected: {response}");
+            let sent = result.ok().unwrap();
+            assert!(sent.history_saved);
+            assert_eq!(sent.message.text, text);
+            assert_eq!(sent.message.account_id, id);
+            assert_eq!(
+                sent.message.id,
+                api.send_payload.lock().await.as_ref().unwrap()["msg"]["client_id"]
+            );
+            assert_eq!(
+                provider.messages(&id).await.unwrap().messages.len(),
+                index + 1
+            );
+        }
+        *api.send_response.lock().await = Some(json!({}));
+        provider.send(&notification()).await.unwrap();
+        let reloaded =
+            IlinkProvider::new_for_test(base_url, path, CancellationToken::new()).unwrap();
+        assert_eq!(reloaded.messages(&id).await.unwrap().messages.len(), 5);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn unconfirmed_and_other_rejections_do_not_invalidate_context_or_record_success() {
         let (api, base_url, server) = spawn_api().await;
         let directory = TempDir::new().unwrap();
@@ -1923,8 +1973,11 @@ mod tests {
             IlinkProvider::new_for_test(base_url, path, CancellationToken::new()).unwrap();
         let id = provider.accounts().await.accounts[0].id.clone();
         for (response, expected_code) in [
-            (json!({}), "provider_unavailable"),
-            (json!({"errcode": 0}), "provider_unavailable"),
+            (json!(null), "provider_unavailable"),
+            (json!([]), "provider_unavailable"),
+            (json!(""), "provider_unavailable"),
+            (json!({"ret": "0"}), "provider_unavailable"),
+            (json!({"errcode": "invalid"}), "provider_unavailable"),
             (
                 json!({"ret": -2, "errmsg": "rate limited"}),
                 "wechat_request_rejected",

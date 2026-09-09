@@ -807,7 +807,8 @@ mod tests {
             Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         let upstream = Router::new().route(
             "/ilink/bot/sendmessage",
-            post(|| async { Json(json!({"ret": 0})) }),
+            // Tencent's successful send ACK can omit zero-valued return codes.
+            post(|| async { Json(json!({})) }),
         );
         let handle = tokio::spawn(async move {
             axum::serve(listener, upstream).await.unwrap();
