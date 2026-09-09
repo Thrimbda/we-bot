@@ -8,6 +8,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
+use crate::console_auth::ConsoleAuth;
+
 #[derive(Clone)]
 pub struct Secret(Arc<str>);
 
@@ -29,6 +31,7 @@ pub struct Config {
     pub allowed_hosts: Vec<String>,
     pub dedupe_ttl: Duration,
     pub rate_limit_per_minute: usize,
+    pub console_auth: Option<ConsoleAuth>,
 }
 
 impl Config {
@@ -69,6 +72,14 @@ impl Config {
         )?);
         let rate_limit_per_minute =
             parse_number("WE_BOT_RATE_LIMIT_PER_MINUTE", 60_usize, 1, 10_000)?;
+        let console_auth = match (
+            env::var("WE_BOT_AUTH_GATEWAY_URL").ok(),
+            env::var("WE_BOT_CONSOLE_ORIGIN").ok(),
+        ) {
+            (None, None) => None,
+            (Some(gateway), Some(origin)) => Some(ConsoleAuth::new(&gateway, &origin)?),
+            _ => bail!("set both WE_BOT_AUTH_GATEWAY_URL and WE_BOT_CONSOLE_ORIGIN"),
+        };
 
         Ok(Self {
             bind_addr,
@@ -77,6 +88,7 @@ impl Config {
             allowed_hosts,
             dedupe_ttl,
             rate_limit_per_minute,
+            console_auth,
         })
     }
 }

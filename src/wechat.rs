@@ -21,6 +21,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::{
+    chat::{
+        ChatMessage, HISTORY_LIMIT, MAX_MESSAGE_CHARS, MessageDirection, MessageHistory,
+        SendMessageResponse,
+    },
     model::Notification,
     provider::{NotificationProvider, ProviderError},
 };
@@ -34,7 +38,7 @@ const BOT_TYPE: &str = "3";
 const LOGIN_TTL: Duration = Duration::from_secs(5 * 60);
 const QR_POLL_TIMEOUT: Duration = Duration::from_secs(40);
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_TEXT_CHARS: usize = 4_000;
+const MAX_TEXT_CHARS: usize = MAX_MESSAGE_CHARS;
 const MAX_QR_FIELD_BYTES: usize = 8_192;
 const STALE_TOKEN_CODE: i64 = -14;
 
@@ -74,10 +78,14 @@ struct PersistedState {
     get_updates_buf: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    messages: Vec<ChatMessage>,
 }
 
 fn state_version() -> u8 {
-    1
+    2
 }
 
 impl Default for PersistedState {
@@ -90,6 +98,8 @@ impl Default for PersistedState {
             base_url: None,
             get_updates_buf: String::new(),
             context_token: None,
+            account_id: None,
+            messages: Vec::new(),
         }
     }
 }
@@ -101,6 +111,16 @@ impl PersistedState {
 
     fn ready(&self) -> bool {
         self.linked() && self.context_token.is_some()
+    }
+
+    fn remember(&mut self, message: ChatMessage) {
+        if self.messages.iter().any(|known| known.id == message.id) {
+            return;
+        }
+        self.messages.push(message);
+        if self.messages.len() > HISTORY_LIMIT {
+            self.messages.drain(..self.messages.len() - HISTORY_LIMIT);
+        }
     }
 }
 
@@ -125,6 +145,20 @@ pub enum WeChatConnectionState {
 pub struct WeChatStatus {
     pub state: WeChatConnectionState,
     pub monitor_running: bool,
+}
+
+#[derive(Serialize)]
+pub struct WeChatAccount {
+    pub id: String,
+    pub display_name: String,
+    pub state: WeChatConnectionState,
+    pub monitor_running: bool,
+    pub last_message: Option<ChatMessage>,
+}
+
+#[derive(Serialize)]
+pub struct WeChatAccounts {
+    pub accounts: Vec<WeChatAccount>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -262,6 +296,96 @@ struct InboundMessage {
     from_user_id: Option<String>,
     #[serde(default)]
     context_token: Option<String>,
+    #[serde(default)]
+    message_id: Option<u64>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    create_time_ms: Option<u64>,
+    #[serde(default)]
+    message_type: Option<u8>,
+    #[serde(default)]
+    item_list: Vec<InboundItem>,
+}
+
+#[derive(Deserialize)]
+struct InboundItem {
+    #[serde(rename = "type", default)]
+    kind: u8,
+    #[serde(default)]
+    text_item: Option<InboundText>,
+    #[serde(default)]
+    voice_item: Option<InboundText>,
+    #[serde(default)]
+    file_item: Option<InboundFile>,
+}
+
+#[derive(Deserialize)]
+struct InboundText {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct InboundFile {
+    #[serde(default)]
+    file_name: String,
+}
+
+impl InboundMessage {
+    fn to_chat(&self, account_id: &str) -> Option<ChatMessage> {
+        // Type 1 is a user message; do not render bot echoes as user replies.
+        if self.message_type.is_some_and(|kind| kind != 1) || self.item_list.is_empty() {
+            return None;
+        }
+        let text = self
+            .item_list
+            .iter()
+            .map(|item| match item.kind {
+                1 => item
+                    .text_item
+                    .as_ref()
+                    .map(|item| item.text.clone())
+                    .unwrap_or_default(),
+                2 => "[图片，请在微信中查看]".to_owned(),
+                3 => item
+                    .voice_item
+                    .as_ref()
+                    .filter(|item| !item.text.is_empty())
+                    .map(|item| format!("[语音] {}", item.text))
+                    .unwrap_or_else(|| "[语音，请在微信中查看]".to_owned()),
+                4 => item
+                    .file_item
+                    .as_ref()
+                    .map(|item| format!("[文件] {}", item.file_name))
+                    .unwrap_or_else(|| "[文件，请在微信中查看]".to_owned()),
+                5 => "[视频，请在微信中查看]".to_owned(),
+                _ => "[暂不支持的消息，请在微信中查看]".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.trim().is_empty() {
+            return None;
+        }
+        let id = if let Some(id) = self.message_id.filter(|id| *id != 0) {
+            format!("in:{id}")
+        } else if let Some(id) = self.client_id.as_ref().filter(|id| !id.is_empty()) {
+            format!("in:{id}")
+        } else {
+            // Some upstream events have no ID. Their cursor is committed with the history.
+            format!("in:{}", random_hex(16).ok()?)
+        };
+        Some(ChatMessage {
+            id,
+            account_id: account_id.to_owned(),
+            direction: MessageDirection::Incoming,
+            text: text.chars().take(MAX_MESSAGE_CHARS).collect(),
+            created_at_ms: self
+                .create_time_ms
+                .filter(|time| *time > 0)
+                .unwrap_or_else(|| unix_millis() as u64),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -329,7 +453,14 @@ impl IlinkProvider {
 
     pub async fn status(&self) -> WeChatStatus {
         let state = self.inner.state.read().await;
-        let connection = if !state.linked() {
+        WeChatStatus {
+            state: self.connection_state(&state),
+            monitor_running: self.inner.monitor_running.load(Ordering::Acquire),
+        }
+    }
+
+    fn connection_state(&self, state: &PersistedState) -> WeChatConnectionState {
+        if !state.linked() {
             WeChatConnectionState::NotLinked
         } else if self.inner.auth_stale.load(Ordering::Acquire) {
             WeChatConnectionState::RelinkRequired
@@ -337,11 +468,37 @@ impl IlinkProvider {
             WeChatConnectionState::Ready
         } else {
             WeChatConnectionState::WaitingForMessage
-        };
-        WeChatStatus {
-            state: connection,
-            monitor_running: self.inner.monitor_running.load(Ordering::Acquire),
         }
+    }
+
+    pub async fn accounts(&self) -> WeChatAccounts {
+        let state = self.inner.state.read().await;
+        let accounts = state
+            .account_id
+            .as_ref()
+            .filter(|_| state.linked())
+            .map(|id| WeChatAccount {
+                id: id.clone(),
+                display_name: format!("微信账户 · {}", &id[id.len().saturating_sub(6)..]),
+                state: self.connection_state(&state),
+                monitor_running: self.inner.monitor_running.load(Ordering::Acquire),
+                last_message: state.messages.last().cloned(),
+            })
+            .into_iter()
+            .collect();
+        WeChatAccounts { accounts }
+    }
+
+    pub async fn messages(&self, account_id: &str) -> Result<MessageHistory, ProviderError> {
+        let state = self.inner.state.read().await;
+        if !state.linked() || state.account_id.as_deref() != Some(account_id) {
+            return Err(ProviderError::AccountNotFound);
+        }
+        Ok(MessageHistory {
+            account_id: account_id.to_owned(),
+            messages: state.messages.clone(),
+            limit: HISTORY_LIMIT,
+        })
     }
 
     pub async fn start_login(&self) -> Result<StartLoginResponse, WeChatControlError> {
@@ -535,6 +692,21 @@ impl IlinkProvider {
                 *login_guard = None;
                 drop(login_guard);
 
+                let mut state_guard = self.inner.state.write().await;
+                let same_account = state_guard.bot_id.as_deref() == Some(&bot_id)
+                    && state_guard.user_id.as_deref() == Some(&user_id);
+                let existing_id = if same_account {
+                    state_guard.account_id.clone()
+                } else {
+                    None
+                };
+                let account_id = match existing_id {
+                    Some(id) => id,
+                    None => format!(
+                        "wa_{}",
+                        random_hex(16).map_err(WeChatControlError::Upstream)?
+                    ),
+                };
                 let next_state = PersistedState {
                     version: state_version(),
                     bot_token: Some(bot_token),
@@ -543,10 +715,17 @@ impl IlinkProvider {
                     base_url: Some(base_url.to_string()),
                     get_updates_buf: String::new(),
                     context_token: None,
+                    account_id: Some(account_id),
+                    messages: if same_account {
+                        state_guard.messages.clone()
+                    } else {
+                        Vec::new()
+                    },
                 };
                 persist_state(&self.inner.state_path, &next_state)
                     .map_err(WeChatControlError::Persistence)?;
-                *self.inner.state.write().await = next_state;
+                *state_guard = next_state;
+                drop(state_guard);
                 self.inner.auth_stale.store(false, Ordering::Release);
                 self.restart_monitor().await;
 
@@ -704,17 +883,29 @@ impl IlinkProvider {
                 .msgs
                 .iter()
                 .rev()
-                .find(|message| message.from_user_id.as_deref() == Some(user_id.as_str()))
-                .and_then(|message| message.context_token.as_ref())
-                .filter(|token| !token.is_empty())
+                .filter(|message| message.from_user_id.as_deref() == Some(user_id.as_str()))
+                .filter_map(|message| message.context_token.as_ref())
+                .find(|token| !token.is_empty())
                 .cloned();
 
-            if next_cursor != cursor || next_context.is_some() {
+            if next_cursor != cursor || next_context.is_some() || !updates.msgs.is_empty() {
                 let mut state_guard = self.inner.state.write().await;
-                if state_guard.bot_id.as_deref() != Some(bot_id.as_str()) {
+                if state_guard.bot_id.as_deref() != Some(bot_id.as_str())
+                    || state_guard.user_id.as_deref() != Some(user_id.as_str())
+                    || state_guard.bot_token.as_deref() != Some(bot_token.as_str())
+                {
                     break;
                 }
                 let mut next_state = state_guard.clone();
+                if let Some(account_id) = next_state.account_id.clone() {
+                    for message in &updates.msgs {
+                        if message.from_user_id.as_deref() == Some(user_id.as_str())
+                            && let Some(message) = message.to_chat(&account_id)
+                        {
+                            next_state.remember(message);
+                        }
+                    }
+                }
                 next_state.get_updates_buf.clone_from(&next_cursor);
                 if let Some(context) = next_context {
                     next_state.context_token = Some(context);
@@ -808,10 +999,34 @@ impl NotificationProvider for IlinkProvider {
     }
 
     async fn send(&self, notification: &Notification) -> Result<(), ProviderError> {
+        self.send_text(None, format_notification(notification))
+            .await
+            .map(|_| ())
+    }
+}
+
+impl IlinkProvider {
+    pub async fn send_message(
+        &self,
+        account_id: &str,
+        text: String,
+    ) -> Result<SendMessageResponse, ProviderError> {
+        self.send_text(Some(account_id), text).await
+    }
+
+    async fn send_text(
+        &self,
+        requested_account: Option<&str>,
+        text: String,
+    ) -> Result<SendMessageResponse, ProviderError> {
+        let state = self.inner.state.read().await.clone();
+        if requested_account.is_some_and(|id| state.account_id.as_deref() != Some(id)) {
+            return Err(ProviderError::AccountNotFound);
+        }
         if self.inner.auth_stale.load(Ordering::Acquire) {
             return Err(ProviderError::SessionStale);
         }
-        let state = self.inner.state.read().await.clone();
+        let account_id = state.account_id.ok_or(ProviderError::NotLinked)?;
         let bot_token = state.bot_token.ok_or(ProviderError::NotLinked)?;
         let user_id = state.user_id.ok_or(ProviderError::NotLinked)?;
         let context_token = state.context_token.ok_or(ProviderError::ContextNotReady)?;
@@ -821,7 +1036,6 @@ impl NotificationProvider for IlinkProvider {
             .and_then(|value| Url::parse(value).ok())
             .ok_or(ProviderError::InvalidResponse)?;
 
-        let text = format_notification(notification);
         if text.chars().count() > MAX_TEXT_CHARS {
             return Err(ProviderError::PayloadTooLarge);
         }
@@ -855,7 +1069,31 @@ impl NotificationProvider for IlinkProvider {
             }
             return Err(ProviderError::Rejected { code });
         }
-        Ok(())
+        let message = ChatMessage {
+            id: client_id,
+            account_id: account_id.clone(),
+            direction: MessageDirection::Outgoing,
+            text,
+            created_at_ms: unix_millis() as u64,
+        };
+        let mut state_guard = self.inner.state.write().await;
+        let history_saved = if state_guard.account_id.as_deref() == Some(&account_id) {
+            state_guard.remember(message.clone());
+            match persist_state(&self.inner.state_path, &state_guard) {
+                Ok(()) => true,
+                Err(_) => {
+                    // The message was accepted upstream. Returning an error here would invite a duplicate send.
+                    warn!("message accepted by iLink, but conversation history could not be saved");
+                    false
+                }
+            }
+        } else {
+            false // A concurrent rebind must never attach this message to another account.
+        };
+        Ok(SendMessageResponse {
+            message,
+            history_saved,
+        })
     }
 }
 
@@ -986,9 +1224,9 @@ fn load_state(
         }
         Err(error) => return Err(error).context("failed to read WeChat state"),
     };
-    let state: PersistedState =
+    let mut state: PersistedState =
         serde_json::from_slice(&bytes).context("failed to parse WeChat state")?;
-    if state.version != state_version() {
+    if state.version != 1 && state.version != state_version() {
         bail!("unsupported WeChat state version");
     }
     let linked_field_count = [
@@ -1006,6 +1244,30 @@ fn load_state(
     if state.context_token.is_some() && !state.linked() {
         bail!("WeChat state contains context without an account");
     }
+    let mut migrated = state.version != state_version();
+    state.version = state_version();
+    if state.linked() && state.account_id.is_none() {
+        state.account_id = Some(format!("wa_{}", random_hex(16)?));
+        migrated = true;
+    }
+    if let Some(id) = &state.account_id
+        && (id.len() != 35
+            || !id.starts_with("wa_")
+            || !id[3..].bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        bail!("stored account ID is invalid");
+    }
+    if state
+        .messages
+        .iter()
+        .any(|message| Some(&message.account_id) != state.account_id.as_ref())
+    {
+        bail!("conversation history does not match the bound account");
+    }
+    if state.messages.len() > HISTORY_LIMIT {
+        state.messages.drain(..state.messages.len() - HISTORY_LIMIT);
+        migrated = true;
+    }
     if let Some(value) = state.base_url.as_deref() {
         let parsed = Url::parse(value).context("stored iLink base URL is invalid")?;
         if !allow_insecure && !is_trusted_ilink_url(&parsed) {
@@ -1020,6 +1282,9 @@ fn load_state(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .context("failed to secure WeChat state permissions")?;
+    }
+    if migrated {
+        persist_state(path, &state).context("failed to migrate WeChat account state")?;
     }
     Ok(state)
 }
@@ -1068,7 +1333,7 @@ mod tests {
         fs,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicI64, Ordering},
         },
         time::Duration,
     };
@@ -1087,8 +1352,9 @@ mod tests {
 
     use super::{IlinkProvider, WeChatConnectionState, format_notification, trusted_redirect_url};
     use crate::{
+        chat::{ChatMessage, HISTORY_LIMIT, MessageDirection},
         model::{Notification, Priority},
-        provider::NotificationProvider,
+        provider::{NotificationProvider, ProviderError},
     };
 
     #[derive(Clone)]
@@ -1098,6 +1364,8 @@ mod tests {
         send_headers: Arc<Mutex<Option<HeaderMap>>>,
         qr_request: Arc<Mutex<Option<(HeaderMap, Uri, Value)>>>,
         send_notify: Arc<Notify>,
+        owner_id: Arc<Mutex<String>>,
+        send_code: Arc<AtomicI64>,
     }
 
     async fn qr(
@@ -1113,12 +1381,12 @@ mod tests {
         }))
     }
 
-    async fn qr_status() -> Json<Value> {
+    async fn qr_status(State(state): State<MockApi>) -> Json<Value> {
         Json(json!({
             "status": "confirmed",
             "bot_token": "ilink-secret-token",
             "ilink_bot_id": "bot-id@im.bot",
-            "ilink_user_id": "owner-user-id"
+            "ilink_user_id": state.owner_id.lock().await.clone()
         }))
     }
 
@@ -1130,10 +1398,26 @@ mod tests {
                 "longpolling_timeout_ms": 1000,
                 "msgs": [{
                     "from_user_id": "owner-user-id",
-                    "context_token": "owner-context-token"
+                    "context_token": "owner-context-token",
+                    "message_id": 701,
+                    "message_type": 1,
+                    "create_time_ms": 1788883200000_u64,
+                    "item_list": [{"type": 1, "text_item": {"text": "微信发回的消息"}}]
+                }, {
+                    "from_user_id": "owner-user-id",
+                    "message_id": 701,
+                    "message_type": 1,
+                    "item_list": [{"type": 1, "text_item": {"text": "微信发回的消息"}}]
                 }, {
                     "from_user_id": "untrusted-user-id",
-                    "context_token": "untrusted-context-token"
+                    "context_token": "untrusted-context-token",
+                    "message_id": 702,
+                    "item_list": [{"type": 1, "text_item": {"text": "不属于本账户的消息"}}]
+                }, {
+                    "from_user_id": "owner-user-id",
+                    "message_id": 703,
+                    "message_type": 2,
+                    "item_list": [{"type": 1, "text_item": {"text": "机器人回声"}}]
                 }]
             }));
         }
@@ -1149,7 +1433,7 @@ mod tests {
         *state.send_payload.lock().await = Some(payload);
         *state.send_headers.lock().await = Some(headers);
         state.send_notify.notify_one();
-        Json(json!({ "ret": 0 }))
+        Json(json!({ "ret": state.send_code.load(Ordering::Acquire) }))
     }
 
     async fn lifecycle() -> Json<Value> {
@@ -1163,6 +1447,8 @@ mod tests {
             send_headers: Arc::new(Mutex::new(None)),
             qr_request: Arc::new(Mutex::new(None)),
             send_notify: Arc::new(Notify::new()),
+            owner_id: Arc::new(Mutex::new("owner-user-id".to_owned())),
+            send_code: Arc::new(AtomicI64::new(0)),
         };
         let app = Router::new()
             .route("/ilink/bot/get_bot_qrcode", post(qr))
@@ -1277,6 +1563,34 @@ mod tests {
         assert_eq!(stored["get_updates_buf"], "next-cursor");
         assert_eq!(stored["context_token"], "owner-context-token");
 
+        let accounts = provider.accounts().await;
+        let account_id = &accounts.accounts[0].id;
+        let history = provider.messages(account_id).await.unwrap();
+        assert_eq!(
+            history.messages.len(),
+            2,
+            "duplicate, stranger, and bot echo are excluded"
+        );
+        assert_eq!(history.messages[0].text, "微信发回的消息");
+        assert_eq!(history.messages[0].created_at_ms, 1788883200000);
+        assert_eq!(history.messages[1].direction, MessageDirection::Outgoing);
+        assert!(
+            history
+                .messages
+                .iter()
+                .all(|message| &message.account_id == account_id)
+        );
+        let public_data = serde_json::to_string(&(accounts, history)).unwrap();
+        for secret in [
+            "owner-user-id",
+            "bot-id@im.bot",
+            "ilink-secret-token",
+            "owner-context-token",
+            "untrusted-user-id",
+        ] {
+            assert!(!public_data.contains(secret));
+        }
+
         shutdown.cancel();
         server.abort();
     }
@@ -1295,5 +1609,164 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is_validation());
+    }
+
+    fn legacy_state() -> Value {
+        json!({
+            "version": 1, "bot_token": "test-bot-token", "bot_id": "test-bot-id",
+            "user_id": "test-owner-id", "base_url": "https://ilinkai.weixin.qq.com/",
+            "context_token": "test-context", "get_updates_buf": "legacy-cursor"
+        })
+    }
+
+    #[tokio::test]
+    async fn legacy_binding_gets_a_stable_public_id_without_losing_context() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("state.json");
+        fs::write(&path, legacy_state().to_string()).unwrap();
+        let provider = IlinkProvider::new(path.clone(), CancellationToken::new()).unwrap();
+        let id = provider.accounts().await.accounts[0].id.clone();
+        assert!(id.starts_with("wa_"));
+        assert!(provider.messages(&id).await.unwrap().messages.is_empty());
+        let reloaded = IlinkProvider::new(path.clone(), CancellationToken::new()).unwrap();
+        assert_eq!(reloaded.accounts().await.accounts[0].id, id);
+        let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], 2);
+        assert_eq!(stored["context_token"], "test-context");
+        assert_eq!(stored["get_updates_buf"], "legacy-cursor");
+    }
+
+    #[tokio::test]
+    async fn targeted_chat_rejects_wrong_account_and_preserves_accepted_delivery_on_disk_failure() {
+        let (api, base_url, server) = spawn_api().await;
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("state.json");
+        let mut fixture = legacy_state();
+        fixture["base_url"] = json!(base_url.as_str());
+        fs::write(&path, fixture.to_string()).unwrap();
+        let provider =
+            IlinkProvider::new_for_test(base_url, path.clone(), CancellationToken::new()).unwrap();
+        assert!(matches!(
+            provider
+                .send_message("wrong-account", "test".to_owned())
+                .await,
+            Err(ProviderError::AccountNotFound)
+        ));
+        assert!(api.send_payload.lock().await.is_none());
+        let id = provider.accounts().await.accounts[0].id.clone();
+        let sent = provider
+            .send_message(&id, "准确发送到当前账户".to_owned())
+            .await
+            .unwrap();
+        assert!(sent.history_saved);
+        assert_eq!(
+            api.send_payload.lock().await.as_ref().unwrap()["msg"]["to_user_id"],
+            "test-owner-id"
+        );
+        assert_eq!(
+            provider.messages(&id).await.unwrap().messages[0].text,
+            "准确发送到当前账户"
+        );
+        api.send_code.store(1001, Ordering::Release);
+        assert!(
+            provider
+                .send_message(&id, "拒绝发送".to_owned())
+                .await
+                .is_err()
+        );
+        assert_eq!(provider.messages(&id).await.unwrap().messages.len(), 1);
+        api.send_code.store(0, Ordering::Release);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let accepted = provider
+            .send_message(&id, "已提交但无法保存".to_owned())
+            .await
+            .unwrap();
+        assert!(
+            !accepted.history_saved,
+            "disk failure must not encourage resending an accepted message"
+        );
+        assert_eq!(provider.messages(&id).await.unwrap().messages.len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relink_keeps_same_account_history_and_new_owner_gets_a_new_mapping() {
+        let (api, base_url, server) = spawn_api().await;
+        let directory = TempDir::new().unwrap();
+        let shutdown = CancellationToken::new();
+        let provider = IlinkProvider::new_for_test(
+            base_url,
+            directory.path().join("state.json"),
+            shutdown.clone(),
+        )
+        .unwrap();
+        let login = provider.start_login().await.unwrap();
+        provider.poll_login(&login.login_id, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(provider.status().await.state, WeChatConnectionState::Ready) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let id = provider.accounts().await.accounts[0].id.clone();
+        let login = provider.start_login().await.unwrap();
+        provider.poll_login(&login.login_id, None).await.unwrap();
+        assert_eq!(provider.accounts().await.accounts[0].id, id);
+        assert_eq!(provider.messages(&id).await.unwrap().messages.len(), 1);
+        *api.owner_id.lock().await = "another-owner".to_owned();
+        let login = provider.start_login().await.unwrap();
+        provider.poll_login(&login.login_id, None).await.unwrap();
+        let new_id = provider.accounts().await.accounts[0].id.clone();
+        assert_ne!(id, new_id);
+        assert!(provider.messages(&id).await.is_err());
+        assert!(
+            provider
+                .messages(&new_id)
+                .await
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert!(matches!(
+            provider.send_message(&id, "old target".to_owned()).await,
+            Err(ProviderError::AccountNotFound)
+        ));
+        shutdown.cancel();
+        server.abort();
+    }
+
+    #[test]
+    fn history_is_bounded_and_media_is_readable_without_exposing_media_credentials() {
+        let message: super::InboundMessage = serde_json::from_value(json!({
+            "message_id": 8, "message_type": 1, "item_list": [
+                {"type": 2, "image_item": {"aeskey": "private-media-key"}},
+                {"type": 3, "voice_item": {"text": "语音转写"}},
+                {"type": 4, "file_item": {"file_name": "报告.pdf"}}
+            ]
+        }))
+        .unwrap();
+        let chat = message.to_chat("account-a").unwrap();
+        assert!(chat.text.contains("语音转写"));
+        assert!(chat.text.contains("报告.pdf"));
+        assert!(
+            !serde_json::to_string(&chat)
+                .unwrap()
+                .contains("private-media-key")
+        );
+        let mut state = super::PersistedState::default();
+        for index in 0..HISTORY_LIMIT + 5 {
+            state.remember(ChatMessage {
+                id: index.to_string(),
+                ..chat.clone()
+            });
+        }
+        assert_eq!(state.messages.len(), HISTORY_LIMIT);
+        assert_eq!(state.messages[0].id, "5");
+        assert_eq!(
+            state.messages.last().unwrap().id,
+            (HISTORY_LIMIT + 4).to_string()
+        );
     }
 }

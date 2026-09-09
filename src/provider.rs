@@ -11,6 +11,8 @@ pub trait NotificationProvider: Send + Sync {
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
+    #[error("the selected WeChat account was not found")]
+    AccountNotFound,
     #[error("WeChat ClawBot is not linked")]
     NotLinked,
     #[error("WeChat ClawBot is waiting for the owner to send it a message")]
@@ -32,6 +34,7 @@ pub enum ProviderError {
 impl ProviderError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::AccountNotFound => "account_not_found",
             Self::NotLinked => "wechat_not_linked",
             Self::ContextNotReady => "wechat_context_not_ready",
             Self::SessionStale => "wechat_relink_required",
@@ -44,6 +47,9 @@ impl ProviderError {
 
     pub fn public_message(&self) -> &'static str {
         match self {
+            Self::AccountNotFound => {
+                "the selected WeChat account is no longer bound to this server"
+            }
             Self::NotLinked => "WeChat ClawBot has not been linked",
             Self::ContextNotReady => {
                 "send any message to the linked WeChat ClawBot before sending notifications"

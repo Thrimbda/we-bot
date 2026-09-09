@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
         config.api_token,
         config.allowed_hosts,
         cancellation_token.child_token(),
+        config.console_auth,
     );
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(address = %config.bind_addr, "we-bot listening");
