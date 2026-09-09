@@ -49,7 +49,7 @@ curl "https://notify.example.com/wechat/accounts/$ACCOUNT_ID/messages" \
 
 微信会对发送上下文施加时效或连续发送限制；已有 `context_token` 不代表可以无限主动推送。若 iLink 明确返回 `ret=-2, errmsg="prepare failed"`，本条消息未被接受，账户会转为「等待微信消息」，并停止复用被拒绝的上下文。请在微信中给当前 ClawBot 发一条新消息；收信监听取得新上下文后会恢复发送，网页草稿需手动重试。REST/MCP 与网页共用此状态。此处理不硬编码上游配额或过期时长，也不绕过微信限制。
 
-其他明确拒绝与网络超时分别返回拒绝、结果未知；只有收到 `ret=0` 的明确确认才记录「已提交微信」。上游同类限制见 [Tencent/openclaw-weixin#81](https://github.com/Tencent/openclaw-weixin/issues/81) 与 [#202](https://github.com/Tencent/openclaw-weixin/issues/202)。
+其他明确拒绝与网络超时分别返回拒绝、结果未知。iLink 成功 ACK 允许省略值为零的 `ret` / `errcode`，例如 HTTP 200 的 `{}`；与腾讯官方客户端一致，合法 JSON 对象且没有非零错误码时记录「已提交微信」。HTTP 错误、空响应体、无效 JSON 或字段类型不匹配仍作为结果未知处理；「已提交」不代表用户已读。上游同类限制见 [Tencent/openclaw-weixin#81](https://github.com/Tencent/openclaw-weixin/issues/81) 与 [#202](https://github.com/Tencent/openclaw-weixin/issues/202)。
 
 收发记录随状态文件以 `0600` 权限保存，最多保留当前账户最近 200 条。从此版本开始接收到的消息才会记录，无法补齐升级前的聊天历史。文字及语音转写可直接展示，图片、视频、文件显示类型提示，媒体内容需在微信中查看。来自其他微信用户的消息与机器人回声不会进入当前账户会话。微信昵称、头像不在当前上游登录响应中，控制台使用公开账户 ID 的短标识展示。
 
